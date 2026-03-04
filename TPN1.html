@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TPN 電子化處方箋成效評估</title>
+
+  <!-- UI -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <!-- Charts + Excel export (Dashboard 等級) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&display=swap');
+    body { font-family: 'Noto Sans TC', sans-serif; background-color: #F8FAFC; overflow-x: hidden; }
+    .animate-fadeIn { animation: fadeIn 0.6s ease-out; }
+    .animate-slideIn { animation: slideIn 0.5s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+
+<body>
+  <div id="root"></div>
+
+  <!-- Firebase bootstrap -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, addDoc, onSnapshot, serverTimestamp, query, orderBy } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    const startApp = async () => {
+      try {
+        let config;
+        if (typeof __firebase_config !== 'undefined') {
+          config = JSON.parse(__firebase_config);
+        } else {
+          // Firebase Config fallback
+          config = {
+            apiKey: "AIzaSyAYdu322gIj9_vB7P0wliV2lkq7bWu46oM",
+            authDomain: "tpn-survey.firebaseapp.com",
+            projectId: "tpn-survey",
+            storageBucket: "tpn-survey.firebasestorage.app",
+            messagingSenderId: "890251445944",
+            appId: "1:890251445944:web:81ccfd66f02791776b164d"
+          };
+        }
+
+        const app = initializeApp(config);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        // AppId（可固定）
+        const appId = 'tpn-survey-app';
+
+        try {
+          await signInAnonymously(auth);
+        } catch (authErr) {
+          window.FirebaseError = authErr.code === 'auth/admin-restricted-operation'
+            ? "API 權限受限：請確認 Firebase Authentication 已啟用「匿名登入」，並確認 Authorized domains 已加入 kmuhudcttpn-bit.github.io。"
+            : authErr.message;
+          window.dispatchEvent(new Event('firebase-error'));
+          return;
+        }
+
+        window.FirebaseService = {
+          auth, db, appId,
+          collection, addDoc, onSnapshot, serverTimestamp,
+          onAuthStateChanged, query, orderBy
+        };
+        window.dispatchEvent(new Event('firebase-ready'));
+      } catch (e) {
+        window.FirebaseError = e.message;
+        window.dispatchEvent(new Event('firebase-error'));
+      }
+    };
+
+    startApp();
+  </script>
+
+  <!-- App -->
+  <script type="text/babel">
+    const { useEffect, useMemo, useRef, useState } = React;
+
+    // ====== Utils ======
+    const Icon = ({ name, className }) => {
+      useEffect(() => { if (window.lucide) window.lucide.createIcons(); }, [name]);
+      return <i data-lucide={name} className={className}></i>;
+    };
+
+    const toDateKey = (ts) => {
+      if (!ts) return null;
+      const d = ts?.toDate ? ts.toDate() : new Date(ts);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    };
+
+    const withinRange = (dateKey, start, end) => {
+      if (!dateKey) return false;
+      if (start && dateKey < start) return false;
+      if (end && dateKey > end) return false;
+      return true;
+    };
+
+    const safeAvg6 = (arr) => {
+      if (!Array.isArray(arr) || arr.length !== 6) return 0;
+      const s = arr.reduce((a, b) => a + (Number(b) || 0), 0);
+      return s / 6;
+    };
+
+    // ====== Chart components ======
+    const ChartBox = ({ title, subtitle, right, children }) => (
+      <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-xl">
+        <div className="flex items-start justify-between gap-4 mb-4">
+          <div>
+            <div className="text-lg font-black text-gray-800">{title}</div>
+            {subtitle && <div className="text-xs text-gray-400 font-bold mt-1">{subtitle}</div>}
+          </div>
+          {right}
+        </div>
+        {children}
+      </div>
+    );
+
+    const GroupBarChart = ({ labels, beforeData, afterData }) => {
+      const canvasRef = useRef(null);
+      const chartRef = useRef(null);
+
+      useEffect(() => {
+        if (!canvasRef.current || !window.Chart) return;
+        if (chartRef.current) chartRef.current.destroy();
+
+        chartRef.current = new Chart(canvasRef.current, {
+          type: 'bar',
+          data: {
+            labels,
+            datasets: [
+              { label: '改善前 (紙本)', data: beforeData },
+              { label: '改善後 (電子)', data: afterData },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'top' } },
+            scales: { y: { min: 0, max: 5, ticks: { stepSize: 1 } } }
+          }
+        });
+
+        return () => { if (chartRef.current) chartRef.current.destroy(); };
+      }, [labels.join('|'), beforeData.join('|'), afterData.join('|')]);
+
+      return <div className="h-80"><canvas ref={canvasRef} /></div>;
+    };
+
+    const DeltaRankChart = ({ labels, deltas }) => {
+      const canvasRef = useRef(null);
+      const chartRef = useRef(null);
+
+      useEffect(() => {
+        if (!canvasRef.current || !window.Chart) return;
+        if (chartRef.current) chartRef.current.destroy();
+
+        chartRef.current = new Chart(canvasRef.current, {
+          type: 'bar',
+          data: {
+            labels,
+            datasets: [{ label: 'Δ (改善後-改善前)', data: deltas }],
+          },
+          options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: { x: { suggestedMin: 0, suggestedMax: 5 } }
+          }
+        });
+
+        return () => { if (chartRef.current) chartRef.current.destroy(); };
+      }, [labels.join('|'), deltas.join('|')]);
+
+      return <div className="h-80"><canvas ref={canvasRef} /></div>;
+    };
+
+    const TrendLineChart = ({ labels, values, seriesLabel }) => {
+      const canvasRef = useRef(null);
+      const chartRef = useRef(null);
+
+      useEffect(() => {
+        if (!canvasRef.current || !window.Chart) return;
+        if (chartRef.current) chartRef.current.destroy();
+
+        chartRef.current = new Chart(canvasRef.current, {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [{ label: seriesLabel, data: values, tension: 0.25, pointRadius: 2 }],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'top' } },
+            scales: { y: { min: 0, max: 5, ticks: { stepSize: 1 } } }
+          }
+        });
+
+        return () => { if (chartRef.current) chartRef.current.destroy(); };
+      }, [labels.join('|'), values.join('|'), seriesLabel]);
+
+      return <div className="h-72"><canvas ref={canvasRef} /></div>;
+    };
+
+    // ====== Main App ======
+    const App = () => {
+      const questions = [
+        "整理與核對處方箋耗時且繁瑣",
+        "處方箋的傳送對工作流程不便",
+        "儲存處方箋需要大量實體空間",
+        "處方修改需聯絡護理端重印與重送",
+        "處方箋的資料回溯查找困難",
+        "對 TPN 作業流程的整體滿意度"
+      ];
+
+      const experienceOptions = ['未滿1年', '1-5年', '6-15年', '15年以上'];
+      const roleOptions = ['藥師', '護理', '行政'];
+
+      const [fbStatus, setFbStatus] = useState('loading'); // loading | ready | error
+      const [step, setStep] = useState('welcome'); // welcome | basic | before | after | results
+      const [user, setUser] = useState(null);
+      const [responses, setResponses] = useState([]);
+      const [isSubmitting, setIsSubmitting] = useState(false);
+      const [error, setError] = useState('');
+
+      // Public dashboard filters
+      const [filters, setFilters] = useState({
+        start: '',
+        end: '',
+        experience: 'ALL',
+        role: 'ALL',
+        unit: 'ALL',
+        trendMetric: 'OVERALL_AFTER' // OVERALL_AFTER | Q6_AFTER | OVERALL_DELTA
+      });
+
+      // Form data (include role/unit)
+      const [formData, setFormData] = useState({
+        experience: '',
+        role: '',
+        unit: '',
+        before: Array(6).fill(0),
+        after: Array(6).fill(0)
+      });
+
+      // Firebase ready/error
+      useEffect(() => {
+        const onReady = () => setFbStatus('ready');
+        const onErr = () => { setFbStatus('error'); setError(window.FirebaseError || 'Firebase 初始化失敗'); };
+
+        window.addEventListener('firebase-ready', onReady);
+        window.addEventListener('firebase-error', onErr);
+
+        if (window.FirebaseService) setFbStatus('ready');
+
+        return () => {
+          window.removeEventListener('firebase-ready', onReady);
+          window.removeEventListener('firebase-error', onErr);
+        };
+      }, []);
+
+      // Auth state
+      useEffect(() => {
+        if (fbStatus !== 'ready') return;
+        return window.FirebaseService.onAuthStateChanged(window.FirebaseService.auth, setUser);
+      }, [fbStatus]);
+
+      // Public: live subscribe to all responses
+      useEffect(() => {
+        if (fbStatus !== 'ready' || !user) return;
+        const { db, appId, collection, onSnapshot, query, orderBy } = window.FirebaseService;
+
+        const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'responses');
+        const q = query(colRef, orderBy('createdAt', 'desc'));
+
+        const unsub = onSnapshot(q, (snap) => {
+          const rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+          setResponses(rows);
+          setError('');
+        }, (err) => {
+          console.error(err);
+          setError(`讀取失敗：${err.message}（請檢查 Firestore Rules 是否允許 read）`);
+        });
+
+        return () => unsub();
+      }, [fbStatus, user]);
+
+      // Filtered responses
+      const filtered = useMemo(() => {
+        const rows = responses.map(r => ({ ...r, _day: toDateKey(r.createdAt) }));
+        return rows
+          .filter(r => withinRange(r._day, filters.start, filters.end))
+          .filter(r => filters.experience === 'ALL' ? true : (r.experience === filters.experience))
+          .filter(r => filters.role === 'ALL' ? true : (r.role === filters.role))
+          .filter(r => filters.unit === 'ALL' ? true : (r.unit === filters.unit));
+      }, [responses, filters]);
+
+      // Dynamic options for filters
+      const filterOptions = useMemo(() => {
+        const exps = Array.from(new Set(responses.map(r => r.experience).filter(Boolean))).sort();
+        const roles = Array.from(new Set(responses.map(r => r.role).filter(Boolean))).sort();
+        const units = Array.from(new Set(responses.map(r => r.unit).filter(Boolean))).sort();
+        return { exps, roles, units };
+      }, [responses]);
+
+      // Stats: averages
+      const stats = useMemo(() => {
+        if (!filtered.length) return null;
+
+        const n = filtered.length;
+        const bSum = Array(6).fill(0);
+        const aSum = Array(6).fill(0);
+
+        let complete = 0;
+
+        filtered.forEach(r => {
+          const b = Array.isArray(r.before) ? r.before : [];
+          const a = Array.isArray(r.after) ? r.after : [];
+          const ok = b.length === 6 && a.length === 6 && b.every(v => (Number(v) || 0) > 0) && a.every(v => (Number(v) || 0) > 0);
+          if (ok) complete += 1;
+
+          for (let i = 0; i < 6; i++) {
+            bSum[i] += Number(b[i] || 0);
+            aSum[i] += Number(a[i] || 0);
+          }
+        });
+
+        const bAvg = bSum.map(x => x / n);
+        const aAvg = aSum.map(x => x / n);
+        const delta = aAvg.map((x, i) => x - bAvg[i]);
+
+        const overallBefore = bAvg.reduce((s, v) => s + v, 0) / 6;
+        const overallAfter = aAvg.reduce((s, v) => s + v, 0) / 6;
+        const overallDelta = overallAfter - overallBefore;
+
+        const top = delta.map((d, i) => ({ i, d })).sort((x, y) => y.d - x.d)[0];
+
+        return {
+          n,
+          bAvg,
+          aAvg,
+          delta,
+          overallBefore,
+          overallAfter,
+          overallDelta,
+          completenessRate: complete / n,
+          topImprovement: { i: top.i, text: `Q${top.i + 1} ${questions[top.i]}`, delta: top.d }
+        };
+      }, [filtered]);
+
+      // Trend: group by day
+      const trend = useMemo(() => {
+        if (!filtered.length) return null;
+
+        const m = new Map(); // day -> {sum,count}
+        filtered.forEach(r => {
+          const day = toDateKey(r.createdAt);
+          if (!day) return;
+
+          let val = 0;
+          if (filters.trendMetric === 'Q6_AFTER') {
+            val = Number(r.after?.[5] || 0);
+          } else if (filters.trendMetric === 'OVERALL_DELTA') {
+            val = safeAvg6(r.after) - safeAvg6(r.before);
+          } else {
+            val = safeAvg6(r.after);
+          }
+
+          const cur = m.get(day) || { sum: 0, count: 0 };
+          cur.sum += val;
+          cur.count += 1;
+          m.set(day, cur);
+        });
+
+        const days = Array.from(m.keys()).sort();
+        const values = days.map(d => m.get(d).sum / m.get(d).count);
+        return { days, values };
+      }, [filtered, filters.trendMetric]);
+
+      // Submit
+      const handleSubmit = async () => {
+        if (!user) return alert("登入狀態失效，請重新整理頁面。");
+        if (!formData.experience) return alert("請先選擇年資。");
+        if (!formData.role) return alert("請先選擇角色。");
+        if (!formData.unit.trim()) return alert("請填寫單位/院區。");
+        if (formData.before.some(v => v === 0) || formData.after.some(v => v === 0)) return alert("請完成所有評分題目。");
+
+        setIsSubmitting(true);
+        const { db, appId, collection, addDoc, serverTimestamp } = window.FirebaseService;
+
+        try {
+          await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'responses'), {
+            experience: formData.experience,
+            role: formData.role,
+            unit: formData.unit.trim(),
+            before: formData.before,
+            after: formData.after,
+            userId: user.uid,
+            createdAt: serverTimestamp(),
+          });
+          setStep('results'); // 填完直接看公開 Dashboard
+        } catch (err) {
+          alert("提交失敗：" + err.message);
+        } finally {
+          setIsSubmitting(false);
+        }
+      };
+
+      // Export CSV (filtered)
+      const exportCSV = () => {
+        if (!filtered.length) return;
+        const header = [
+          "ID", "填答日期", "年資", "角色", "單位",
+          ...questions.flatMap((_, i) => [`前Q${i + 1}`, `後Q${i + 1}`, `ΔQ${i + 1}`])
+        ];
+        let csv = "\ufeff" + header.join(",") + "\n";
+
+        filtered.forEach(r => {
+          const day = toDateKey(r.createdAt) || '';
+          const row = [r.id, `"${day}"`, r.experience || '', r.role || '', `"${(r.unit || '').replaceAll('"', '""')}"`];
+          for (let i = 0; i < 6; i++) {
+            const b = Number(r.before?.[i] || 0);
+            const a = Number(r.after?.[i] || 0);
+            row.push(b, a, (a - b).toFixed(2));
+          }
+          csv += row.join(",") + "\n";
+        });
+
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `TPN_Survey_Filtered.csv`;
+        a.click();
+      };
+
+      // Export Excel (filtered)
+      const exportXLSX = () => {
+        if (!filtered.length) return;
+        if (!window.XLSX) return alert("Excel 匯出模組載入失敗（XLSX）");
+
+        const data = filtered.map(r => {
+          const obj = {
+            ID: r.id,
+            日期: toDateKey(r.createdAt) || '',
+            年資: r.experience || '',
+            角色: r.role || '',
+            單位: r.unit || '',
+          };
+          for (let i = 0; i < 6; i++) {
+            const b = Number(r.before?.[i] || 0);
+            const a = Number(r.after?.[i] || 0);
+            obj[`改善前Q${i + 1}`] = b;
+            obj[`改善後Q${i + 1}`] = a;
+            obj[`ΔQ${i + 1}`] = Number((a - b).toFixed(2));
+          }
+          obj["改善前整體平均"] = Number(safeAvg6(r.before).toFixed(2));
+          obj["改善後整體平均"] = Number(safeAvg6(r.after).toFixed(2));
+          obj["Δ整體平均"] = Number((safeAvg6(r.after) - safeAvg6(r.before)).toFixed(2));
+          return obj;
+        });
+
+        const ws = XLSX.utils.json_to_sheet(data);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Responses");
+        XLSX.writeFile(wb, "TPN_Survey_Filtered.xlsx");
+      };
+
+      // ====== Screens ======
+
+      if (fbStatus === 'error') {
+        return (
+          <div className="flex flex-col items-center justify-center p-8 text-center min-h-screen bg-red-50 animate-fadeIn">
+            <Icon name="alert-triangle" className="w-20 h-20 text-red-500 mb-6" />
+            <h2 className="text-2xl font-black mb-4">系統異常</h2>
+            <div className="bg-white p-6 rounded-3xl border border-red-100 shadow-sm max-w-md w-full text-left text-sm">
+              <p className="text-red-600 font-bold mb-3">{error || '未知錯誤'}</p>
+              <hr className="my-3" />
+              <div className="text-gray-600 space-y-2">
+                <div className="font-black">常見原因：</div>
+                <ol className="list-decimal pl-5 space-y-1">
+                  <li>Firebase Authentication 未啟用「匿名」。</li>
+                  <li>Authentication → Settings 未加入 Authorized domains：<code>kmuhudcttpn-bit.github.io</code></li>
+                  <li>Firestore Rules 未允許讀取（你要公開 Dashboard：必須 allow read）。</li>
+                </ol>
+              </div>
+            </div>
+            <button onClick={() => window.location.reload()} className="mt-8 bg-gray-900 text-white px-8 py-3 rounded-2xl font-bold">重新整理</button>
+          </div>
+        );
+      }
+
+      if (fbStatus === 'loading') {
+        return <div className="flex items-center justify-center min-h-screen text-blue-600 font-bold animate-pulse">系統連線中...</div>;
+      }
+
+      // Welcome
+      if (step === 'welcome') {
+        return (
+          <div className="flex flex-col items-center justify-center p-8 text-center min-h-screen max-w-md mx-auto animate-fadeIn">
+            <div className="bg-blue-600 p-6 rounded-[2.5rem] shadow-2xl mb-8 transform hover:scale-105 transition-transform">
+              <Icon name="clipboard-check" className="w-16 h-16 text-white" />
+            </div>
+            <h1 className="text-4xl font-black text-gray-900 mb-4 tracking-tight leading-tight">
+              TPN 電子化處方箋<br />成效評估
+            </h1>
+            <p className="text-gray-500 mb-10">
+              完成問卷後，您可以立即查看彙整後的公開統計報告（即時更新）。
+            </p>
+
+            <button
+              onClick={() => setStep('basic')}
+              className="w-full bg-blue-600 text-white py-5 rounded-3xl font-bold text-xl shadow-xl shadow-blue-100 active:scale-95 transition-all"
+            >
+              開始填答
+            </button>
+
+            <button
+              onClick={() => setStep('results')}
+              className="mt-10 text-blue-600 font-bold text-sm underline"
+            >
+              直接查看目前統計結果
+            </button>
+          </div>
+        );
+      }
+
+      // Basic info (experience + role + unit)
+      if (step === 'basic') {
+        const ok = formData.experience && formData.role && formData.unit.trim();
+        return (
+          <div className="p-8 animate-slideIn max-w-2xl mx-auto min-h-screen flex flex-col justify-center">
+            <h2 className="text-3xl font-black text-gray-800 mb-8 text-center">基本資料</h2>
+
+            <div className="bg-white rounded-[2rem] border border-gray-100 shadow-sm p-6 mb-5">
+              <p className="font-black text-gray-800 mb-3">您的 TPN 工作年資？</p>
+              <div className="grid grid-cols-2 gap-3">
+                {experienceOptions.map(opt => (
+                  <button
+                    key={opt}
+                    onClick={() => setFormData({ ...formData, experience: opt })}
+                    className={`p-4 text-center rounded-2xl border-2 font-bold transition-all ${
+                      formData.experience === opt
+                        ? 'border-blue-600 bg-blue-50 text-blue-700'
+                        : 'border-gray-100 bg-white hover:border-blue-100'
+                    }`}
+                  >
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="bg-white rounded-[2rem] border border-gray-100 shadow-sm p-6 mb-5">
+              <p className="font-black text-gray-800 mb-3">您的角色？</p>
+              <div className="grid grid-cols-3 gap-3">
+                {roleOptions.map(opt => (
+                  <button
+                    key={opt}
+                    onClick={() => setFormData({ ...formData, role: opt })}
+                    className={`p-4 text-center rounded-2xl border-2 font-bold transition-all ${
+                      formData.role === opt
+                        ? 'border-blue-600 bg-blue-50 text-blue-700'
+                        : 'border-gray-100 bg-white hover:border-blue-100'
+                    }`}
+                  >
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="bg-white rounded-[2rem] border border-gray-100 shadow-sm p-6 mb-10">
+              <p className="font-black text-gray-800 mb-3">您的單位/院區？（例如：病房A、加護病房、藥局調劑室）</p>
+              <input
+                value={formData.unit}
+                onChange={(e) => setFormData({ ...formData, unit: e.target.value })}
+                className="w-full border-2 border-gray-100 rounded-2xl px-4 py-3 font-bold outline-none focus:border-blue-200"
+                placeholder="請輸入單位/院區"
+              />
+            </div>
+
+            <button
+              disabled={!ok}
+              onClick={() => setStep('before')}
+              className={`w-full py-5 rounded-3xl font-black text-xl shadow-lg transition-all ${
+                ok ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-400'
+              }`}
+            >
+              下一步
+            </button>
+          </div>
+        );
+      }
+
+      // Before / After
+      if (step === 'before' || step === 'after') {
+        const isBefore = step === 'before';
+        const cur = isBefore ? formData.before : formData.after;
+
+        return (
+          <div className="p-6 animate-slideIn max-w-4xl mx-auto pb-24">
+            <div className="flex flex-col md:flex-row md:items-center justify-between mb-8 gap-4">
+              <h2 className={`text-xl font-black px-6 py-3 rounded-2xl text-white shadow-md inline-block ${isBefore ? 'bg-amber-500' : 'bg-emerald-600'}`}>
+                {isBefore ? '第一階段：改善前 (紙本)' : '第二階段：改善後 (電子)'}
+              </h2>
+              <div className="text-[10px] font-bold text-gray-400 bg-white p-2 px-4 rounded-lg border border-gray-100">
+                1 非常不同意 | 5 非常同意
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              {questions.map((q, i) => (
+                <div key={i} className="bg-white p-5 rounded-[2rem] border border-gray-100 shadow-sm flex flex-col md:flex-row md:items-center gap-4 hover:shadow-md transition-shadow">
+                  <div className="flex-grow font-bold text-gray-800 leading-snug">
+                    <span className="text-blue-600 mr-2 italic text-sm">Q{i + 1}</span>{q}
+                  </div>
+                  <div className="flex items-center gap-1 md:w-60">
+                    {[1,2,3,4,5].map(v => (
+                      <button
+                        key={v}
+                        onClick={() => {
+                          const d = [...cur];
+                          d[i] = v;
+                          setFormData({ ...formData, [isBefore ? 'before' : 'after']: d });
+                        }}
+                        className={`flex-1 py-3 rounded-xl font-black text-lg transition-all border-2 ${
+                          cur[i] === v
+                            ? (isBefore
+                                ? 'bg-amber-500 border-amber-500 text-white scale-110 shadow-lg'
+                                : 'bg-emerald-600 border-emerald-600 text-white scale-110 shadow-lg')
+                            : 'bg-gray-50 border-gray-50 text-gray-300'
+                        }`}
+                      >
+                        {v}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex gap-4 mt-10">
+              <button
+                onClick={() => setStep(isBefore ? 'basic' : 'before')}
+                className="flex-1 bg-white border-2 border-gray-100 text-gray-500 py-5 rounded-3xl font-bold"
+              >
+                返回
+              </button>
+
+              <button
+                onClick={isBefore
+                  ? () => (cur.some(v => v === 0) ? alert('請完成所有評分題目') : setStep('after'))
+                  : handleSubmit
+                }
+                disabled={isSubmitting}
+                className={`flex-[2] py-5 rounded-3xl font-black text-white shadow-xl ${isBefore ? 'bg-amber-600' : 'bg-emerald-600'} ${isSubmitting ? 'opacity-50' : ''}`}
+              >
+                {isSubmitting ? '正在傳送資料...' : isBefore ? '下一步' : '送出問卷並查看結果'}
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      // Results (Public Dashboard)
+      if (step === 'results') {
+        const deltaRank = stats
+          ? stats.delta.map((d, i) => ({ i, label: `Q${i + 1}`, delta: d }))
+              .sort((a, b) => b.delta - a.delta)
+          : [];
+
+        return (
+          <div className="p-6 max-w-6xl mx-auto pb-24 animate-fadeIn">
+            <div className="flex flex-col items-center text-center mb-8">
+              <div className="bg-blue-600 p-4 rounded-3xl shadow-2xl mb-4">
+                <Icon name="bar-chart-3" className="w-10 h-10 text-white" />
+              </div>
+              <h2 className="text-3xl font-black text-gray-800">即時統計 Dashboard</h2>
+              <p className="text-gray-500 font-medium mt-2">
+                此頁為公開彙整結果；資料會即時更新（可依年資/角色/單位/日期篩選）。
+              </p>
+            </div>
+
+            {/* Filters */}
+            <div className="bg-white p-5 rounded-[2rem] border border-gray-100 shadow-sm mb-6">
+              <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+                <div>
+                  <div className="text-[11px] font-black text-gray-500 mb-1">開始日期</div>
+                  <input
+                    type="date"
+                    value={filters.start}
+                    onChange={(e) => setFilters({ ...filters, start: e.target.value })}
+                    className="w-full border-2 border-gray-100 rounded-2xl px-3 py-2 font-bold outline-none focus:border-blue-200"
+                  />
+                </div>
+                <div>
+                  <div className="text-[11px] font-black text-gray-500 mb-1">結束日期</div>
+                  <input
+                    type="date"
+                    value={filters.end}
+                    onChange={(e) => setFilters({ ...filters, end: e.target.value })}
+                    className="w-full border-2 border-gray-100 rounded-2xl px-3 py-2 font-bold outline-none focus:border-blue-200"
+                  />
+                </div>
+                <div>
+                  <div className="text-[11px] font-black text-gray-500 mb-1">年資</div>
+                  <select
+                    value={filters.experience}
+                    onChange={(e) => setFilters({ ...filters, experience: e.target.value })}
+                    className="w-full border-2 border-gray-100 rounded-2xl px-3 py-2 font-bold outline-none focus:border-blue-200"
+                  >
+                    <option value="ALL">全部</option>
+                    {filterOptions.exps.map(x => <option key={x} value={x}>{x}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <div className="text-[11px] font-black text-gray-500 mb-1">角色</div>
+                  <select
+                    value={filters.role}
+                    onChange={(e) => setFilters({ ...filters, role: e.target.value })}
+                    className="w-full border-2 border-gray-100 rounded-2xl px-3 py-2 font-bold outline-none focus:border-blue-200"
+                  >
+                    <option value="ALL">全部</option>
+                    {filterOptions.roles.map(x => <option key={x} value={x}>{x}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <div className="text-[11px] font-black text-gray-500 mb-1">單位</div>
+                  <select
+                    value={filters.unit}
+                    onChange={(e) => setFilters({ ...filters, unit: e.target.value })}
+                    className="w-full border-2 border-gray-100 rounded-2xl px-3 py-2 font-bold outline-none focus:border-blue-200"
+                  >
+                    <option value="ALL">全部</option>
+                    {filterOptions.units.map(x => <option key={x} value={x}>{x}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between mt-4 gap-3">
+                <div className="text-xs text-gray-400 font-bold">
+                  {stats
+                    ? <>篩選後樣本數 N：{stats.n}｜完整率：{Math.round(stats.completenessRate * 100)}%</>
+                    : <>篩選後樣本數 N：0</>
+                  }
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <div className="text-[11px] font-black text-gray-500">趨勢指標</div>
+                  <select
+                    value={filters.trendMetric}
+                    onChange={(e) => setFilters({ ...filters, trendMetric: e.target.value })}
+                    className="border-2 border-gray-100 rounded-2xl px-3 py-2 font-bold outline-none focus:border-blue-200"
+                  >
+                    <option value="OVERALL_AFTER">整體平均（改善後）</option>
+                    <option value="Q6_AFTER">Q6 滿意度（改善後）</option>
+                    <option value="OVERALL_DELTA">Δ 整體改善幅度（後-前）</option>
+                  </select>
+
+                  <button
+                    onClick={() => setFilters({ ...filters, start: '', end: '', experience: 'ALL', role: 'ALL', unit: 'ALL' })}
+                    className="bg-gray-900 text-white px-4 py-2 rounded-2xl font-black"
+                  >
+                    清除篩選
+                  </button>
+
+                  <button
+                    onClick={exportCSV}
+                    className="bg-white border border-gray-100 px-4 py-2 rounded-2xl font-black text-gray-700 hover:bg-gray-50"
+                    title="匯出 CSV（依篩選）"
+                  >
+                    CSV
+                  </button>
+                  <button
+                    onClick={exportXLSX}
+                    className="bg-blue-600 text-white px-4 py-2 rounded-2xl font-black hover:bg-blue-700"
+                    title="匯出 Excel（依篩選）"
+                  >
+                    Excel
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Error banner for read */}
+            {error && (
+              <div className="bg-amber-50 border border-amber-100 text-amber-800 p-4 rounded-2xl font-bold text-sm mb-6">
+                <span className="inline-flex items-center gap-2">
+                  <Icon name="alert-circle" className="w-4 h-4" />
+                  {error}
+                </span>
+              </div>
+            )}
+
+            {!stats ? (
+              <div className="text-center py-20 text-gray-400 font-bold border-2 border-dashed rounded-3xl">
+                目前篩選條件下無數據（或資料讀取中）
+              </div>
+            ) : (
+              <>
+                {/* KPI row */}
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                  <div className="bg-blue-900 text-white p-6 rounded-[2rem] shadow-xl">
+                    <div className="text-xs font-bold opacity-60">樣本數 N</div>
+                    <div className="text-4xl font-black mt-2">{stats.n}</div>
+                  </div>
+
+                  <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-xl">
+                    <div className="text-xs font-bold text-gray-400">整體平均改善 Δ</div>
+                    <div className="text-3xl font-black text-gray-900 mt-2">{stats.overallDelta.toFixed(2)}</div>
+                    <div className="text-[11px] font-bold text-gray-400 mt-2">
+                      前 {stats.overallBefore.toFixed(2)} → 後 {stats.overallAfter.toFixed(2)}
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-xl">
+                    <div className="text-xs font-bold text-gray-400">Q6（滿意度）改善 Δ</div>
+                    <div className="text-3xl font-black text-gray-900 mt-2">{stats.delta[5].toFixed(2)}</div>
+                    <div className="text-[11px] font-bold text-gray-400 mt-2">
+                      前 {stats.bAvg[5].toFixed(2)} → 後 {stats.aAvg[5].toFixed(2)}
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-xl">
+                    <div className="text-xs font-bold text-gray-400">最大改善題</div>
+                    <div className="text-sm font-black text-gray-900 mt-2 leading-snug">{stats.topImprovement.text}</div>
+                    <div className="text-[11px] font-bold text-gray-400 mt-2">Δ {stats.topImprovement.delta.toFixed(2)}</div>
+                  </div>
+                </div>
+
+                {/* Charts */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  <ChartBox
+                    title="改善前後平均分對照（6題）"
+                    subtitle="群組長條圖：每題改善前 vs 改善後平均分（1–5）"
+                    right={<span className="text-[11px] font-black text-gray-400">即時更新</span>}
+                  >
+                    <GroupBarChart
+                      labels={questions.map((_, i) => `Q${i + 1}`)}
+                      beforeData={stats.bAvg.map(x => Number(x.toFixed(2)))}
+                      afterData={stats.aAvg.map(x => Number(x.toFixed(2)))}
+                    />
+                  </ChartBox>
+
+                  <ChartBox
+                    title="改善幅度 Δ 排名"
+                    subtitle="Δ = 改善後 - 改善前（由大到小）"
+                  >
+                    <DeltaRankChart
+                      labels={deltaRank.map(x => x.label)}
+                      deltas={deltaRank.map(x => Number(x.delta.toFixed(2)))}
+                    />
+                  </ChartBox>
+
+                  <ChartBox
+                    title="趨勢圖（按日期）"
+                    subtitle={
+                      filters.trendMetric === 'Q6_AFTER' ? 'Q6（改善後）每日平均' :
+                      filters.trendMetric === 'OVERALL_DELTA' ? 'Δ（後-前）每日平均' :
+                      '整體平均（改善後）每日平均'
+                    }
+                  >
+                    <TrendLineChart
+                      labels={trend ? trend.days : []}
+                      values={trend ? trend.values.map(v => Number(v.toFixed(2))) : []}
+                      seriesLabel={
+                        filters.trendMetric === 'Q6_AFTER' ? 'Q6（改善後）' :
+                        filters.trendMetric === 'OVERALL_DELTA' ? 'Δ 整體改善（後-前）' :
+                        '整體平均（改善後）'
+                      }
+                    />
+                  </ChartBox>
+
+                  <ChartBox
+                    title="原始資料（預覽）"
+                    subtitle="顯示最新 50 筆；完整資料可用匯出取得"
+                  >
+                    <div className="overflow-auto rounded-2xl border border-gray-100">
+                      <table className="min-w-full text-xs">
+                        <thead className="bg-gray-50">
+                          <tr className="text-left text-gray-500">
+                            <th className="p-3 font-black">日期</th>
+                            <th className="p-3 font-black">年資</th>
+                            <th className="p-3 font-black">角色</th>
+                            <th className="p-3 font-black">單位</th>
+                            <th className="p-3 font-black">Δ整體</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {filtered.slice(0, 50).map(r => {
+                            const db = safeAvg6(r.before);
+                            const da = safeAvg6(r.after);
+                            const d = da - db;
+                            return (
+                              <tr key={r.id} className="border-t border-gray-50">
+                                <td className="p-3 font-bold text-gray-700">{toDateKey(r.createdAt) || '-'}</td>
+                                <td className="p-3 font-bold text-gray-700">{r.experience || '-'}</td>
+                                <td className="p-3 font-bold text-gray-700">{r.role || '-'}</td>
+                                <td className="p-3 font-bold text-gray-700">{r.unit || '-'}</td>
+                                <td className="p-3 font-black text-gray-900">{d.toFixed(2)}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </ChartBox>
+                </div>
+              </>
+            )}
+
+            <div className="mt-10 flex flex-col items-center gap-3">
+              <button
+                onClick={() => setStep('welcome')}
+                className="text-gray-400 font-bold hover:text-blue-600 transition-colors"
+              >
+                回到歡迎頁面
+              </button>
+              <div className="text-[11px] text-gray-400 font-bold">
+                你已設定為「填答完立即可見」：不需要管理者權限
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      return null;
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
